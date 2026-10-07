@@ -2880,6 +2880,10 @@ function floorToThree(scene: ThreejsSceneCache, floor: FloorMeshData) {
 
 	let model = new THREE.Mesh(geo, mat);
 	model.userData = floor.extra;
+	//keep a copy of the raw triangle index list around: it isn't needed for rendering
+	//(the geometry is drawn as indexed triangles directly) but gltf export needs to know
+	//the actual triangles in order to bake the floor texture blending into standard uvs
+	model.userData.floorindices = floor.indices;
 	model.name = `floor ${floor.chunk.mapsquarex},${floor.chunk.mapsquarez} (${floor.level})`;
 	return model;
 }

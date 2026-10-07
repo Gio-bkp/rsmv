@@ -780,6 +780,11 @@ export async function exportThreeJsGltf(node: THREE.Object3D) {
 		"RA_skinWeight_bone",
 		"RA_skinWeight_skin"
 	];
+	//floor meshes use custom interleaved uv attributes (texcoord_0/1/2 + per-vertex blend weights)
+	//which are only interpreted by the shader injected via augmentThreeJsFloorMaterial.
+	//GLTFExporter only serializes the standard "uv" attribute into TEXCOORD_0, so without help
+	//the exported floors have no valid uvs and blender shows atlas artifacts ("floor 0" squares).
+	let flooruvattribs = ["texcoord_0", "texcoord_1", "texcoord_2", "color_1", "color_2"];
 	//there doesn't seem to be any good way to hook the exporter, so just temporarily edit the scene
 	let proms: Promise<void>[] = [];
 	node.traverseVisible(node => {
@@ -820,6 +825,44 @@ export async function exportThreeJsGltf(node: THREE.Object3D) {
 					mat.normalMap.magFilter = THREE.LinearFilter;
 				}));
 			}
+			//is this a floor mesh? (created by floorToThree in mapsquare.ts)
+			if (attributes.texcoord_0 && attributes.color_1 && attributes.color_2) {
+				//the floors blend up to 3 overlapping atlas textures per vertex (texcoord_0/1/2 weighted
+				//by color_1, tinted by color_2), which only the injected floor shader understands.
+				//GLTFExporter just writes "uv" -> TEXCOORD_0, so without help the exported floors have
+				//no valid uvs and blender shows raw atlas regions as squares on top of the "floor 0" mesh.
+				//bake the whole blend into a single texture + matching standard uv attribute for export.
+				let baked = mat.map ? bakeFloorTexture(node.geometry, mat.map, (node.userData as any)?.floorindices) : null;
+				if (baked) {
+					let haduv = "uv" in attributes;
+					let olduv = attributes.uv;
+					attributes.uv = baked.attrib;
+					undolist.push(() => {
+						if (haduv) attributes.uv = olduv;
+						else delete attributes.uv;
+					});
+					let matany = node.material as THREE.Material & { map?: THREE.Texture | null };
+					if (matany.map) {
+						//swap in the baked texture on a cloned material so the exporter doesn't dedupe
+						//materials/textures across chunks that share the same live atlas object
+						let oldmat = matany;
+						let expmat = oldmat.clone();
+						expmat.vertexColors = false;//vertex tint is already baked into the texture
+						(expmat as any).map = baked.texture;
+						node.material = expmat as any;
+						undolist.push(() => node.material = oldmat);
+					}
+				}
+				//these custom attributes aren't part of the gltf spec and choke blender
+				for (let attr of flooruvattribs) {
+					if (attributes[attr]) {
+						let attrname = attr;
+						let oldval = attributes[attr];
+						delete attributes[attr];
+						undolist.push(() => attributes[attrname] = oldval);
+					}
+				}
+			}
 			//for some reason blender chokes on these
 			for (let attr of hiddenattributes) {
 				if (attributes[attr]) {
@@ -840,6 +883,151 @@ export async function exportThreeJsGltf(node: THREE.Object3D) {
 	});
 	undolist.forEach(q => q());
 	return res;
+}
+
+type BakedFloorUv = {
+	attrib: THREE.BufferAttribute,
+	texture: THREE.Texture,
+};
+
+/**
+ * Reimplements the floor fragment shader blending (augmentThreeJsFloorMaterial in modeltothree.ts)
+ * on the cpu: each triangle gets one flat color = sum over its 3 vertices of
+ *   weight_i * atlasTexel(texcoord_i) * mix(1, vertexColor, usescolor_i),
+ * which matches the shader because rs3 floor uvs are per-vertex exact texel centers with no interpolation.
+ * The baked colors are packed into a small texture and every triangle is given a unique uv inside it,
+ * producing a fully standard gltf mesh (TEXCOORD_0 + baseColorTexture) that blender renders correctly.
+ */
+function bakeFloorTexture(geometry: BufferGeometry, map: THREE.Texture, floorindices?: Uint32Array): BakedFloorUv | null {
+	let col = geometry.getAttribute("color");
+	let uv0 = geometry.getAttribute("texcoord_0");
+	let uv1 = geometry.getAttribute("texcoord_1");
+	let uv2 = geometry.getAttribute("texcoord_2");
+	let weights = geometry.getAttribute("color_1");
+	let usescolor = geometry.getAttribute("color_2");
+	if (!col || !uv0 || !uv1 || !uv2 || !weights || !usescolor) return null;
+	let atlasimg = map.image as HTMLCanvasElement | OffscreenCanvas | ImageBitmap | null;
+	if (!atlasimg) return null;
+	let atlasw = atlasimg.width, atlash = atlasimg.height;
+	if (!atlasw || !atlash) return null;
+
+	//read the atlas pixels
+	let acnv = document.createElement("canvas");
+	acnv.width = atlasw;
+	acnv.height = atlash;
+	let actx = acnv.getContext("2d", { willReadFrequently: true })!;
+	actx.drawImage(atlasimg as CanvasImageSource, 0, 0);
+	let atlasdata: Uint8ClampedArray;
+	try {
+		atlasdata = actx.getImageData(0, 0, atlasw, atlash).data;
+	} catch (e) {
+		console.warn("floor atlas not readable for gltf export", e);
+		return null;
+	}
+
+	//floor meshes have no geometry index (they are drawn straight from the vertex buffer),
+	//so prefer the raw triangle list kept in userData by floorToThree if present
+	let index: THREE.BufferAttribute | Uint32Array | null = (floorindices && floorindices.length >= 3) ? floorindices : geometry.getIndex();
+	let tricount: number;
+	if (index) {
+		tricount = Math.floor(((index as any).length ?? (index as any).count) / 3);
+	} else {
+		tricount = Math.floor(col.count / 3);
+	}
+	if (tricount == 0) return null;
+	const getIdx = (i: number) => (index as any).getX(i);
+
+	//sample the atlas with nearest filtering (matches LinearFilter at exact texel centers)
+	const sampleAtlas = (attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute, vi: number, out: number[]) => {
+		let u = attr.getX(vi), v = attr.getY(vi);
+		let px = Math.min(atlasw - 1, Math.max(0, Math.floor(u * atlasw)));
+		let py = Math.min(atlash - 1, Math.max(0, Math.floor(v * atlash)));
+		let o = (py * atlasw + px) * 4;
+		out[0] = atlasdata[o];
+		out[1] = atlasdata[o + 1];
+		out[2] = atlasdata[o + 2];
+	};
+
+	let rgb = [0, 0, 0];
+	let trirgb = new Float32Array(tricount * 3);
+	for (let tri = 0; tri < tricount; tri++) {
+		let rsum = 0, gsum = 0, bsum = 0;
+		for (let k = 0; k < 3; k++) {
+			let vi = index ? getIdx(tri * 3 + k) : tri * 3 + k;
+			let cr = col.getX(vi), cg = col.getY(vi), cb = col.getZ(vi);
+			let w0 = weights.getX(vi), w1 = weights.getY(vi), w2 = weights.getZ(vi);
+			let wsum = w0 + w1 + w2;
+			if (wsum <= 0) {
+				//no textures -> plain vertex color (shader: mix(diffuseColor, texelColor, dot(weights)))
+				rsum += cr; gsum += cg; bsum += cb;
+				continue;
+			}
+			for (let i = 0; i < 3; i++) {
+				let w = i == 0 ? w0 : i == 1 ? w1 : w2;
+				if (w <= 0) continue;
+				let attr = i == 0 ? uv0 : i == 1 ? uv1 : uv2;
+				sampleAtlas(attr, vi, rgb);
+				let uc = i == 0 ? usescolor.getX(vi) : i == 1 ? usescolor.getY(vi) : usescolor.getZ(vi);
+				//mix(vec4(1), diffuseColor, usescolor) per channel
+				rsum += rgb[0] * w * (1 + cr * uc - uc);
+				gsum += rgb[1] * w * (1 + cg * uc - uc);
+				bsum += rgb[2] * w * (1 + cb * uc - uc);
+			}
+		}
+		trirgb[tri * 3 + 0] = rsum;
+		trirgb[tri * 3 + 1] = gsum;
+		trirgb[tri * 3 + 2] = bsum;
+	}
+
+	//pack the per-triangle colors into a pow2 grid texture
+	let texw = Math.ceil(Math.sqrt(tricount));
+	let texh = texw;
+	while ((texw & (texw - 1)) != 0) texw++;
+	texh = texw;
+	let cnv = document.createElement("canvas");
+	cnv.width = texw;
+	cnv.height = texh;
+	let ctx = cnv.getContext("2d")!;
+	let imgdata = ctx.createImageData(texw, texh);
+	for (let tri = 0; tri < tricount; tri++) {
+		let x = tri % texw, y = Math.floor(tri / texw);
+		let o = (y * texw + x) * 4;
+		imgdata.data[o + 0] = Math.max(0, Math.min(255, Math.round(trirgb[tri * 3 + 0] * 255)));
+		imgdata.data[o + 1] = Math.max(0, Math.min(255, Math.round(trirgb[tri * 3 + 1] * 255)));
+		imgdata.data[o + 2] = Math.max(0, Math.min(255, Math.round(trirgb[tri * 3 + 2] * 255)));
+		imgdata.data[o + 3] = 255;
+	}
+	ctx.putImageData(imgdata, 0, 0);
+
+	//baked textures are generated already flipped vertically so they match gltf/OpenGL uv origin
+	//(THREE.CanvasTexture would otherwise flip them again when rendering)
+	let texture = new THREE.CanvasTexture(cnv);
+	texture.flipY = false;
+	texture.generateMipmaps = false;
+	texture.minFilter = THREE.NearestFilter;
+	texture.magFilter = THREE.NearestFilter;
+	texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
+	texture.colorSpace = map.colorSpace;
+
+	//unique uv at the center of each baked texel, per triangle vertex.
+	//v is measured from the bottom (gltf convention), hence texh - 1 - y
+	let vertcount = col.count;
+	let uvs = new Float32Array(vertcount * 2);
+	for (let tri = 0; tri < tricount; tri++) {
+		let x = tri % texw, y = Math.floor(tri / texw);
+		let u = (x + 0.5) / texw;
+		let v = (texh - 1 - y + 0.5) / texh;
+		for (let k = 0; k < 3; k++) {
+			let vi = index ? getIdx(tri * 3 + k) : tri * 3 + k;
+			uvs[vi * 2 + 0] = u;
+			uvs[vi * 2 + 1] = v;
+		}
+	}
+	let attrib = new THREE.BufferAttribute(uvs, 2);
+	return {
+		attrib,
+		texture,
+	};
 }
 
 export function exportThreeJsStl(node: THREE.Object3D) {
